@@ -1,5 +1,7 @@
 # Xray 多端口管理器（Lite）
 
+当前版本：**v0.1.3**（[Releases](https://github.com/umeabc/xray-multiport-tools/releases)）
+
 轻量、单文件的 **Xray 多端口代理管理工具**（参照 [chaos-zhu/XrayMultiPortManager](https://github.com/chaos-zhu/XrayMultiPortManager) 的功能做的精简复刻版）。
 
 - 仅依赖 **Python 3.8+ 标准库**（GUI 为 tkinter），无需 `pip install` 任何东西
@@ -14,6 +16,7 @@
 | 节点解析 | `vmess://`、`vless://`（含 REALITY）、`trojan://`、`ss://`（SIP002 与 legacy） |
 | 多端口开启 | 每个勾选节点分配一个本地端口，通过 routing 规则同时开启 |
 | 混合端口 | 勾选「混合端口」后每个端口同时支持 HTTP 与 SOCKS5（Xray mixed 入站） |
+| 内网直连 | 访问保留地址（127/8、10/8、172.16/12、192.168/16、fe80::/10 等）一律直连不走代理 |
 | 局域网共享 | 勾选「允许局域网访问」后监听 0.0.0.0，手机/其它电脑可直接用代理 |
 | 延迟测试 | 经本地端口向 `www.gstatic.com/generate_204` 发请求测往返毫秒，多线程并发 |
 | 下载测速 | 经本地端口拉取测速文件统计 KB/s / MB/s，可按结果排序 |

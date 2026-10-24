@@ -37,7 +37,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ---------------------------------------------------------------------------
 
 APP_NAME = "Xray 多端口代理管理器"
-APP_VERSION = "v0.1.2"
+APP_VERSION = "v0.1.3"
 APP_DIR = (
     os.path.dirname(sys.executable)
     if getattr(sys, "frozen", False)
@@ -49,6 +49,27 @@ DEFAULT_XRAY_PATH = os.path.join(APP_DIR, "xray.exe")
 ICON_PATH = os.path.join(APP_DIR, "app.ico")
 
 DEFAULT_BASE_PORT = 10808
+
+# 内网/保留地址（RFC1918/环回/链路本地/组播保留/CGNAT/测试网段 + IPv6 私有段），
+# 与 v2fly geoip private 一致，直接内嵌避免依赖 geoip.dat
+PRIVATE_CIDRS = (
+    "0.0.0.0/8",
+    "10.0.0.0/8",
+    "100.64.0.0/10",
+    "127.0.0.0/8",
+    "169.254.0.0/16",
+    "172.16.0.0/12",
+    "192.0.0.0/24",
+    "192.0.2.0/24",
+    "192.168.0.0/16",
+    "198.18.0.0/15",
+    "198.51.100.0/24",
+    "203.0.113.0/24",
+    "224.0.0.0/3",
+    "::1/128",
+    "fc00::/7",
+    "fe80::/10",
+)
 USER_AGENT = "v2rayN/6.23"
 LATENCY_HOST = "www.gstatic.com"
 LATENCY_PATH = "/generate_204"
@@ -1137,6 +1158,20 @@ def build_xray_config(
         config["routing"]["rules"].insert(
             0, {"type": "field", "inboundTag": ["api"], "outboundTag": "api"}
         )
+    # 内网/保留地址一律直连：置于 api 规则之后、各节点规则之前。
+    # 直接内嵌保留地址 CIDR（等价 geoip:private），无需 geoip.dat 文件依赖
+    private_rule = {
+        "type": "field",
+        "ip": list(PRIVATE_CIDRS),
+        "outboundTag": "direct",
+    }
+    node_rules = config["routing"]["rules"]
+    if api_port and is_valid_port(api_port):
+        # api 规则必须在最前，避免 api 流量(127.0.0.1)被 private 规则截走
+        api_rule, node_rules = node_rules[0], node_rules[1:]
+        config["routing"]["rules"] = [api_rule, private_rule] + node_rules
+    else:
+        config["routing"]["rules"] = [private_rule] + node_rules
     return config
 
 
@@ -2996,7 +3031,13 @@ def selftest():
         config = build_xray_config(nodes)
         _expect(len(config["inbounds"]) == 5, "inbound 数量错误")
         _expect(len(config["outbounds"]) == 7, "outbound 数量错误")
-        _expect(len(config["routing"]["rules"]) == 5, "routing 规则数量错误")
+        _expect(len(config["routing"]["rules"]) == 6, "routing 规则数量错误")
+        _expect(
+            config["routing"]["rules"][0]["outboundTag"] == "direct"
+            and "10.0.0.0/8" in config["routing"]["rules"][0]["ip"]
+            and "fc00::/7" in config["routing"]["rules"][0]["ip"],
+            "内网直连规则缺失",
+        )
 
         inbound_tags = set(item["tag"] for item in config["inbounds"])
         _expect(
@@ -3022,7 +3063,7 @@ def selftest():
             _expect(proto in protocols, "缺少 %s 出站" % proto)
 
         rules = {}
-        for rule in config["routing"]["rules"]:
+        for rule in config["routing"]["rules"][1:]:
             rules[rule["inboundTag"][0]] = rule["outboundTag"]
         outbound_tags = set(item["tag"] for item in config["outbounds"])
         for index in range(5):
@@ -3042,8 +3083,10 @@ def selftest():
             "stats/api/policy 配置缺失",
         )
         _expect(
-            api_cfg["routing"]["rules"][0].get("outboundTag") == "api",
-            "api 路由规则缺失",
+            api_cfg["routing"]["rules"][0].get("outboundTag") == "api"
+            and api_cfg["routing"]["rules"][1].get("outboundTag") == "direct"
+            and "192.168.0.0/16" in (api_cfg["routing"]["rules"][1].get("ip") or []),
+            "api/private 规则顺序错误",
         )
 
         payload = json.dumps(
