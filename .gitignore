@@ -16,3 +16,7 @@ xmp_lite_settings.json
 # 临时文件
 *.tmp
 .*.tmp
+
+# 开发用截图与本地备份（截图可能含个人订阅地址，勿上传）
+shot_*.png
+xray_multi_port.py.bak-*

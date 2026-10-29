@@ -3,8 +3,8 @@
 """Xray 多端口代理管理器（精简版）
 
 单文件、仅标准库。一个 xray.exe 进程开启多个本地 SOCKS5 端口，
-每个端口对应一个节点；支持订阅、链接解析、测延迟/测速、排序、
-进程守护、配置持久化与 Xray-core 自动下载。
+每个端口对应一个节点；支持订阅、链接解析、手动添加/编辑节点、
+测延迟、排序、进程守护、配置持久化与 Xray-core 自动下载。
 
 用法:
     python xray_multi_port.py
@@ -37,7 +37,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ---------------------------------------------------------------------------
 
 APP_NAME = "Xray 多端口代理管理器"
-APP_VERSION = "v0.1.3"
+APP_VERSION = "v0.1.5"
 APP_DIR = (
     os.path.dirname(sys.executable)
     if getattr(sys, "frozen", False)
@@ -73,11 +73,8 @@ PRIVATE_CIDRS = (
 USER_AGENT = "v2rayN/6.23"
 LATENCY_HOST = "www.gstatic.com"
 LATENCY_PATH = "/generate_204"
-SPEED_HOST = "cachefly.cachefly.net"
-SPEED_PATH = "/10mb.test"
-SPEED_MAX_BYTES = 10 * 1024 * 1024
 LATENCY_TIMEOUT = 5.0
-SPEED_TIMEOUT = 12.0
+LATENCY_THREADS = 6
 SUB_TIMEOUT = 20.0
 MAX_LOG_LINES = 1500
 
@@ -91,6 +88,7 @@ NODE_DEFAULTS = {
     "alter_id": 0,
     "security": "auto",
     "flow": "",
+    "user": "",
     "password": "",
     "method": "",
     "network": "tcp",
@@ -108,7 +106,6 @@ NODE_DEFAULTS = {
     "local_port": None,
     "enabled": False,
     "latency": None,
-    "speed": None,
 }
 
 # tkinter 延迟导入（--selftest 不加载）
@@ -132,6 +129,18 @@ def to_int(value, default=None):
         if value is None:
             return default
         return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def to_float(value, default=None):
+    """宽松转 float；bool / 非法值返回 default。"""
+    if isinstance(value, bool):
+        return default
+    try:
+        if value is None:
+            return default
+        return float(str(value).strip())
     except (TypeError, ValueError):
         return default
 
@@ -193,21 +202,9 @@ def redact(text):
             pass
         return "***"
 
-    s = re.sub(r"(?i)\b(?:vmess|vless|trojan|ss)://[^\s\"']+", "***", s)
+    s = re.sub(r"(?i)\b(?:vmess|vless|trojan|ss|socks)://[^\s\"']+", "***", s)
     s = re.sub(r"(?i)\bhttps?://[^\s\"']+", _http_repl, s)
     return s
-
-
-def format_speed(bps):
-    try:
-        v = float(bps)
-    except (TypeError, ValueError):
-        return str(bps) if bps else ""
-    if v >= 1024.0 * 1024.0:
-        return "%.2f MB/s" % (v / (1024.0 * 1024.0))
-    if v >= 1024.0:
-        return "%.1f KB/s" % (v / 1024.0)
-    return "%.0f B/s" % v
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +239,9 @@ def normalize_node(raw):
     proto = str(raw.get("proto") or "").strip().lower()
     if proto == "shadowsocks":
         proto = "ss"
-    if proto not in ("vmess", "vless", "trojan", "ss"):
+    if proto in ("socks5", "socks5h"):
+        proto = "socks"
+    if proto not in ("vmess", "vless", "trojan", "ss", "socks"):
         return None
     server = str(raw.get("server") or "").strip()
     port = to_int(raw.get("port"))
@@ -257,6 +256,7 @@ def normalize_node(raw):
     node["name"] = str(node.get("name") or "").strip() or ("%s:%s" % (server, port))
     node["nid"] = str(node.get("nid") or "").strip() or gen_nid()
     node["uuid"] = str(node.get("uuid") or "").strip()
+    node["user"] = str(node.get("user") or "").strip()
     node["password"] = str(node.get("password") or "")
     node["method"] = str(node.get("method") or "").strip()
     node["alter_id"] = max(0, to_int(node.get("alter_id"), 0) or 0)
@@ -284,9 +284,7 @@ def normalize_node(raw):
     lat = node.get("latency")
     if isinstance(lat, bool) or not isinstance(lat, (int, float)):
         node["latency"] = "超时" if lat == "超时" else None
-    spd = node.get("speed")
-    if isinstance(spd, bool) or not isinstance(spd, (int, float)):
-        node["speed"] = "超时" if spd == "超时" else None
+    node.pop("speed", None)  # 清理旧版本遗留的测速字段
     return node
 
 
@@ -297,6 +295,9 @@ def load_settings(path=SETTINGS_PATH):
         "base_port": DEFAULT_BASE_PORT,
         "lan_access": False,
         "mixed_port": False,
+        "latency_timeout": LATENCY_TIMEOUT,
+        "latency_threads": LATENCY_THREADS,
+        "max_log_lines": MAX_LOG_LINES,
         "subs": [],
         "nodes": [],
     }
@@ -316,6 +317,12 @@ def load_settings(path=SETTINGS_PATH):
         settings["base_port"] = base_port
     settings["lan_access"] = bool(data.get("lan_access"))
     settings["mixed_port"] = bool(data.get("mixed_port"))
+    timeout = to_float(data.get("latency_timeout"), LATENCY_TIMEOUT)
+    settings["latency_timeout"] = min(60.0, max(1.0, timeout or LATENCY_TIMEOUT))
+    threads = to_int(data.get("latency_threads"), LATENCY_THREADS)
+    settings["latency_threads"] = min(64, max(1, threads or LATENCY_THREADS))
+    lines = to_int(data.get("max_log_lines"), MAX_LOG_LINES)
+    settings["max_log_lines"] = min(100000, max(100, lines or MAX_LOG_LINES))
 
     subs = []
     seen_urls = set()
@@ -408,7 +415,12 @@ def split_host_port(text):
 
 def node_key(node):
     proto = str(node.get("proto") or "").strip().lower()
-    identity = node.get("uuid") if proto in ("vmess", "vless") else node.get("password")
+    if proto == "socks":
+        identity = "%s|%s" % (node.get("user") or "", node.get("password") or "")
+    else:
+        identity = (
+            node.get("uuid") if proto in ("vmess", "vless") else node.get("password")
+        )
     return "%s|%s|%s|%s" % (
         proto,
         node.get("server") or "",
@@ -438,7 +450,6 @@ def _finish_parsed_node(node):
     node["local_port"] = None
     node["enabled"] = False
     node["latency"] = None
-    node["speed"] = None
     node["sub"] = ""
     return node
 
@@ -609,8 +620,45 @@ def _parse_ss(link):
     return _finish_parsed_node(node)
 
 
+def _parse_socks(link):
+    """解析 socks://[userinfo@]host:port#name（userinfo 可为 base64(user:pass)）。"""
+    rest = link.split("://", 1)[1]
+    body, _, frag = rest.partition("#")
+    body = urllib.parse.unquote(body.split("?", 1)[0]).strip()
+    if not body:
+        return None
+    user = ""
+    password = ""
+    if "@" in body:
+        userinfo, hostport = body.rsplit("@", 1)
+        userinfo = userinfo.strip()
+        if ":" in userinfo:
+            user, password = userinfo.split(":", 1)
+        else:
+            decoded = b64_decode_text(userinfo)
+            if ":" in decoded:
+                user, password = decoded.split(":", 1)
+            else:
+                user = decoded or userinfo
+    else:
+        hostport = body
+    server, port = split_host_port(hostport)
+    name = urllib.parse.unquote(frag.strip())
+    node = _new_node(
+        name=name,
+        proto="socks",
+        server=server,
+        port=port,
+        user=user,
+        password=password,
+        network="tcp",
+        tls="",
+    )
+    return _finish_parsed_node(node)
+
+
 def parse_share_link(link):
-    """解析 vmess/vless/trojan/ss 分享链接；失败返回 None。"""
+    """解析 vmess/vless/trojan/ss/socks 分享链接；失败返回 None。"""
     if not isinstance(link, str):
         return None
     link = link.strip().lstrip("\ufeff")
@@ -626,6 +674,8 @@ def parse_share_link(link):
             node = _parse_trojan(link)
         elif scheme == "ss":
             node = _parse_ss(link)
+        elif scheme in ("socks", "socks5", "socks5h"):
+            node = _parse_socks(link)
         else:
             return None
     except Exception:
@@ -671,8 +721,121 @@ def parse_subscription_text(text):
     return unique, failed
 
 
+def _format_hostport(server, port):
+    """生成 host:port 文本，IPv6 自动加方括号。"""
+    server = str(server or "").strip()
+    if ":" in server and not server.startswith("["):
+        return "[%s]:%d" % (server, port)
+    return "%s:%d" % (server, port)
+
+
+def build_share_link(node):
+    """根据节点参数生成分享链接（vmess/vless/trojan/ss），失败返回空串。
+
+    生成结果可直接被 parse_share_link 还原，用于手动添加/编辑节点后
+    保留与订阅节点一致的「复制分享链接」能力。
+    """
+    if not isinstance(node, dict):
+        return ""
+    proto = str(node.get("proto") or "").strip().lower()
+    if proto == "shadowsocks":
+        proto = "ss"
+    server = str(node.get("server") or "").strip()
+    port = to_int(node.get("port"))
+    if not server or not is_valid_port(port):
+        return ""
+    name = str(node.get("name") or "").strip() or ("%s:%s" % (server, port))
+    fragment = urllib.parse.quote(name, safe="")
+    hostport = _format_hostport(server, port)
+
+    network = _normalize_network(node.get("network"))
+    header_type = str(node.get("header_type") or "").strip().lower()
+    host = str(node.get("host") or "").strip()
+    path = str(node.get("path") or "").strip()
+    service_name = str(node.get("service_name") or "").strip()
+    tls = _normalize_security(node.get("tls"))
+    sni = str(node.get("sni") or "").strip()
+    fp = str(node.get("fp") or "").strip()
+    pbk = str(node.get("pbk") or "").strip()
+    sid = str(node.get("sid") or "").strip()
+    flow = str(node.get("flow") or "").strip()
+    uid = str(node.get("uuid") or "").strip()
+    user = str(node.get("user") or "").strip()
+    password = str(node.get("password") or "")
+    method = str(node.get("method") or "").strip()
+
+    if proto == "vmess":
+        obj = {
+            "v": "2",
+            "ps": name,
+            "add": server,
+            "port": str(port),
+            "id": uid,
+            "aid": str(max(0, to_int(node.get("alter_id"), 0) or 0)),
+            "scy": str(node.get("security") or "auto").strip() or "auto",
+            "net": network,
+            "type": header_type or "none",
+            "host": host,
+            "path": service_name if network == "grpc" else path,
+            "tls": tls,
+            "sni": sni,
+            "fp": fp,
+            "pbk": pbk,
+            "sid": sid,
+        }
+        raw = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+        encoded = base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")
+        return "vmess://" + encoded.rstrip("=")
+
+    if proto in ("vless", "trojan"):
+        params = []
+        if proto == "vless":
+            params.append(("encryption", "none"))
+        params.append(("security", tls if tls else "none"))
+        if flow:
+            params.append(("flow", flow))
+        params.append(("type", network))
+        if header_type:
+            params.append(("headerType", header_type))
+        if fp:
+            params.append(("fp", fp))
+        if sni:
+            params.append(("sni", sni))
+        if pbk:
+            params.append(("pbk", pbk))
+        if sid:
+            params.append(("sid", sid))
+        if host:
+            params.append(("host", host))
+        if path:
+            params.append(("path", path))
+        if service_name:
+            params.append(("serviceName", service_name))
+        query = urllib.parse.urlencode(params)
+        userinfo = uid if proto == "vless" else urllib.parse.quote(password, safe="")
+        return "%s://%s@%s?%s#%s" % (proto, userinfo, hostport, query, fragment)
+
+    if proto == "ss":
+        if not method:
+            return ""
+        userinfo = base64.urlsafe_b64encode(
+            ("%s:%s" % (method, password)).encode("utf-8")
+        ).decode("ascii").rstrip("=")
+        return "ss://%s@%s#%s" % (userinfo, hostport, fragment)
+
+    if proto == "socks":
+        if not user:
+            return "socks://%s#%s" % (hostport, fragment)
+        userinfo = base64.urlsafe_b64encode(
+            ("%s:%s" % (user, password)).encode("utf-8")
+        ).decode("ascii").rstrip("=")
+        return "socks://%s@%s#%s" % (userinfo, hostport, fragment)
+
+    return ""
+
+
 def merge_subscription_nodes(old_nodes, sub_url, new_nodes):
-    """按 key 合并订阅节点，保留旧节点的端口/勾选/测速结果。
+    """按 key 合并订阅节点，保留旧节点的端口/勾选/延迟结果。
 
     返回 (merged_nodes, added, removed, skipped_duplicates)。
     """
@@ -695,7 +858,7 @@ def merge_subscription_nodes(old_nodes, sub_url, new_nodes):
         previous = old_by_key.get(key)
         if previous:
             node["nid"] = previous.get("nid") or node.get("nid") or gen_nid()
-            for field in ("local_port", "enabled", "latency", "speed"):
+            for field in ("local_port", "enabled", "latency"):
                 node[field] = previous.get(field)
             matched.add(key)
         else:
@@ -963,6 +1126,15 @@ def build_outbound(node, tag):
             "streamSettings": stream,
         }
 
+    if proto == "socks":
+        # SOCKS5 上游代理（链式转发）：仅地址/端口，可选用户名密码
+        user = str(node.get("user") or "").strip()
+        password = str(node.get("password") or "")
+        entry = {"address": server, "port": port}
+        if user:
+            entry["users"] = [{"user": user, "pass": password, "level": 0}]
+        return {"tag": tag, "protocol": "socks", "settings": {"servers": [entry]}}
+
     if proto == "ss":
         method = str(node.get("method") or "").strip()
         password = str(node.get("password") or "")
@@ -1083,7 +1255,9 @@ def build_xray_config(
         proto = str(node.get("proto") or "").strip().lower()
         if proto == "shadowsocks":
             proto = "ss"
-        if proto not in ("vmess", "vless", "trojan", "ss"):
+        if proto in ("socks5", "socks5h"):
+            proto = "socks"
+        if proto not in ("vmess", "vless", "trojan", "ss", "socks"):
             continue
         server = str(node.get("server") or "").strip()
         remote_port = to_int(node.get("port"))
@@ -1176,7 +1350,7 @@ def build_xray_config(
 
 
 # ---------------------------------------------------------------------------
-# SOCKS5 极简客户端 / 测速
+# SOCKS5 极简客户端 / 延迟测试
 # ---------------------------------------------------------------------------
 
 
@@ -1276,58 +1450,6 @@ def test_latency(local_port, timeout=LATENCY_TIMEOUT):
         if not buffer.startswith(b"HTTP/"):
             raise OSError("未收到 HTTP 响应")
         return max(1, int(round((time.perf_counter() - started) * 1000.0)))
-    finally:
-        try:
-            sock.close()
-        except OSError:
-            pass
-
-
-def test_download(local_port, timeout=SPEED_TIMEOUT, max_bytes=SPEED_MAX_BYTES):
-    """经本地端口下载测速文件，返回字节/秒。"""
-    started = time.perf_counter()
-    sock = socks5_connect(local_port, SPEED_HOST, 80, timeout)
-    try:
-        request = (
-            "GET %s HTTP/1.1\r\n"
-            "Host: %s\r\n"
-            "User-Agent: %s\r\n"
-            "Accept: */*\r\n"
-            "Connection: close\r\n\r\n"
-            % (SPEED_PATH, SPEED_HOST, USER_AGENT)
-        )
-        sock.sendall(request.encode("ascii"))
-        buffer = b""
-        deadline = started + timeout
-        while b"\r\n\r\n" not in buffer:
-            remaining = deadline - time.perf_counter()
-            if remaining <= 0:
-                raise socket.timeout("下载测速超时")
-            sock.settimeout(remaining)
-            chunk = sock.recv(65536)
-            if not chunk:
-                break
-            buffer += chunk
-        if b"\r\n\r\n" not in buffer:
-            raise OSError("测速响应头不完整")
-        body = buffer.split(b"\r\n\r\n", 1)[1]
-        total = len(body)
-        while total < max_bytes:
-            remaining = deadline - time.perf_counter()
-            if remaining <= 0:
-                break
-            sock.settimeout(min(5.0, remaining))
-            try:
-                chunk = sock.recv(65536)
-            except socket.timeout:
-                break
-            if not chunk:
-                break
-            total += len(chunk)
-        elapsed = time.perf_counter() - started
-        if total <= 0 or elapsed <= 0:
-            raise OSError("未收到测速数据")
-        return float(total) / elapsed
     finally:
         try:
             sock.close()
@@ -1491,6 +1613,9 @@ class App(object):
         self._traffic_cum = {}
         self._traffic_stop = threading.Event()
         self._api_port = None
+        self._max_log_lines = to_int(
+            self.settings.get("max_log_lines"), MAX_LOG_LINES
+        ) or MAX_LOG_LINES
 
         self.sub_var = tk.StringVar()
         self.url_var = tk.StringVar()
@@ -1577,6 +1702,9 @@ class App(object):
         node_frame.pack(fill="x", padx=8, pady=(6, 0))
         node_row = ttk.Frame(node_frame)
         node_row.pack(fill="x")
+        ttk.Button(
+            node_row, text="添加节点", command=lambda: self._open_node_editor()
+        ).pack(side="left", padx=2)
         ttk.Button(node_row, text="导入节点链接", command=self._open_import).pack(
             side="left", padx=2
         )
@@ -1586,99 +1714,61 @@ class App(object):
         ttk.Button(node_row, text="清空", command=lambda: self._set_all_enabled(False)).pack(
             side="left", padx=2
         )
-        self.btn_latency = ttk.Button(
-            node_row, text="测延迟", command=lambda: self._run_tests("latency")
-        )
+        self.btn_latency = ttk.Button(node_row, text="测延迟", command=self._run_tests)
         self.btn_latency.pack(side="left", padx=2)
-        self.btn_speed = ttk.Button(
-            node_row, text="测下载速度", command=lambda: self._run_tests("speed")
-        )
-        self.btn_speed.pack(side="left", padx=2)
         ttk.Button(
             node_row, text="按延迟排序", command=lambda: self._sort_nodes("latency", False)
-        ).pack(side="left", padx=2)
-        ttk.Button(
-            node_row, text="按速度排序", command=lambda: self._sort_nodes("speed", True)
         ).pack(side="left", padx=2)
         ttk.Button(node_row, text="删除选中节点", command=self._delete_selected_nodes).pack(
             side="left", padx=2
         )
 
-        # 3. Xray 核心控制
-        xray_frame = ttk.LabelFrame(parent, text="Xray 核心控制", padding=(8, 4))
+        # 3. Xray 控制（全局参数统一在「全局设置」中修改）
+        xray_frame = ttk.LabelFrame(parent, text="Xray 控制", padding=(8, 4))
         xray_frame.pack(fill="x", padx=8, pady=(6, 0))
-        xray_row1 = ttk.Frame(xray_frame)
-        xray_row1.pack(fill="x")
-        ttk.Label(xray_row1, text="xray.exe路径:").pack(side="left")
-        self.xray_entry = ttk.Entry(xray_row1, textvariable=self.xray_var)
-        self.xray_entry.pack(side="left", fill="x", expand=True, padx=(4, 8))
-        self.xray_entry.bind("<FocusOut>", lambda _e: self.save())
-        ttk.Button(xray_row1, text="浏览...", command=self._browse_xray).pack(
-            side="left", padx=2
-        )
-        self.btn_download = ttk.Button(
-            xray_row1, text="自动下载 xray.exe", command=self._download_xray
-        )
-        self.btn_download.pack(side="left", padx=2)
-
-        xray_row2 = ttk.Frame(xray_frame)
-        xray_row2.pack(fill="x", pady=(4, 0))
-        ttk.Label(xray_row2, text="起始SOCKS5端口:").pack(side="left")
-        self.base_port_entry = ttk.Entry(
-            xray_row2, textvariable=self.base_port_var, width=7, justify="center"
-        )
-        self.base_port_entry.pack(side="left", padx=(4, 10))
-        self.base_port_entry.bind("<FocusOut>", lambda _e: self.save())
-        self.base_port_entry.bind("<Return>", lambda _e: self.save())
-        self.lan_check = ttk.Checkbutton(
-            xray_row2,
-            text="允许局域网访问 (0.0.0.0)",
-            variable=self.lan_var,
-            command=self.save,
-        )
-        self.lan_check.pack(side="left", padx=(8, 2))
-        self.mixed_check = ttk.Checkbutton(
-            xray_row2,
-            text="混合端口 (HTTP+SOCKS)",
-            variable=self.mixed_var,
-            command=self._on_mixed_toggle,
-        )
-        self.mixed_check.pack(side="left", padx=(8, 2))
+        xray_row = ttk.Frame(xray_frame)
+        xray_row.pack(fill="x")
         self.btn_start = ttk.Button(
-            xray_row2, text="▶ 启动所选节点", command=self._start_selected
+            xray_row, text="▶ 启动所选节点", command=self._start_selected
         )
         self.btn_start.pack(side="left", padx=2)
         self.btn_stop = ttk.Button(
-            xray_row2, text="■ 停止", command=self._stop_xray, state="disabled"
+            xray_row, text="■ 停止", command=self._stop_xray, state="disabled"
         )
         self.btn_stop.pack(side="left", padx=2)
         self.status_label = tk.Label(
-            xray_row2,
+            xray_row,
             text="状态: 未运行",
             fg="#666666",
             font=("Microsoft YaHei UI", 9, "bold"),
         )
         self.status_label.pack(side="left", padx=(12, 2))
+        self.btn_download = ttk.Button(
+            xray_row, text="自动下载 xray.exe", command=self._download_xray
+        )
+        self.btn_download.pack(side="right", padx=2)
+        ttk.Button(xray_row, text="⚙ 全局设置", command=self._open_settings).pack(
+            side="right", padx=2
+        )
 
         # 4. 节点表格
         tree_frame = ttk.Frame(parent)
         tree_frame.pack(fill="both", expand=True, padx=8, pady=(6, 0))
         columns = (
             "chk", "name", "proto", "server", "port", "lport",
-            "latency", "speed", "rt", "total",
+            "latency", "rt", "total",
         )
         self.tree = ttk.Treeview(
             tree_frame, columns=columns, show="headings", selectmode="extended"
         )
         specs = [
             ("chk", "☑", 34, "center", False),
-            ("name", "节点名称", 190, "w", True),
+            ("name", "节点名称", 200, "w", True),
             ("proto", "协议", 70, "center", False),
-            ("server", "服务器地址", 150, "w", False),
+            ("server", "服务器地址", 160, "w", False),
             ("port", "远程端口", 65, "center", False),
             ("lport", "本地SOCKS5", 80, "center", False),
-            ("latency", "延迟", 76, "center", False),
-            ("speed", "下载速度", 88, "center", False),
+            ("latency", "延迟", 80, "center", False),
             ("rt", "实时流量", 120, "center", False),
             ("total", "累计流量", 112, "center", False),
         ]
@@ -1702,6 +1792,9 @@ class App(object):
         self.root.bind("<Control-L>", lambda _e: self._show_log_window())
 
         self.menu = tk.Menu(self.root, tearoff=0)
+        self.menu.add_command(
+            label="编辑节点", command=lambda: self._open_editor_for_selection()
+        )
         self.menu.add_command(label="复制分享链接", command=self._copy_link)
         self.menu.add_command(label="复制 SOCKS5 地址", command=self._copy_socks)
         self.menu.add_separator()
@@ -1833,7 +1926,6 @@ class App(object):
         )
         test_state = "disabled" if self.busy_test else "normal"
         self.btn_latency.configure(state=test_state)
-        self.btn_speed.configure(state=test_state)
         self.btn_update_subs.configure(
             state="disabled" if self.busy_subs else "normal"
         )
@@ -1863,8 +1955,8 @@ class App(object):
                 "end", "[%s] %s\n" % (timestamp, redact(message)), tag
             )
             lines = int(self.log_text.index("end-1c").split(".")[0])
-            if lines > MAX_LOG_LINES:
-                self.log_text.delete("1.0", "%d.0" % (lines - MAX_LOG_LINES))
+            if lines > self._max_log_lines:
+                self.log_text.delete("1.0", "%d.0" % (lines - self._max_log_lines))
             self.log_text.configure(state="disabled")
             self.log_text.see("end")
         except Exception:
@@ -1943,23 +2035,17 @@ class App(object):
             self._apply_sub_updates(event[1])
             self._update_buttons()
         elif kind == "test_result":
-            mode, nid, value = event[1], event[2], event[3]
+            nid, value = event[1], event[2]
             node = self._node_by_nid(nid)
             if node is not None:
-                if value is None:
-                    node["latency" if mode == "latency" else "speed"] = "超时"
-                elif mode == "latency":
-                    node["latency"] = int(value)
-                else:
-                    node["speed"] = float(value)
+                node["latency"] = "超时" if value is None else int(value)
                 self._update_row(node)
         elif kind == "test_done":
-            mode, ok, fail = event[1], event[2], event[3]
+            ok, fail = event[1], event[2]
             self.busy_test = False
             self.save()
             self._append_log(
-                "%s完成：成功 %d，超时/失败 %d"
-                % ("延迟测试" if mode == "latency" else "下载测速", ok, fail),
+                "延迟测试完成：成功 %d，超时/失败 %d" % (ok, fail),
                 "ok" if ok else "err",
             )
             self._update_buttons()
@@ -2069,11 +2155,6 @@ class App(object):
             latency_text = str(latency) if latency else ""
         else:
             latency_text = "%d ms" % int(latency)
-        speed = node.get("speed")
-        if isinstance(speed, bool) or not isinstance(speed, (int, float)):
-            speed_text = str(speed) if speed else ""
-        else:
-            speed_text = format_speed(speed)
         local_port = node.get("local_port")
         rates = self._traffic_rates.get(local_port)
         cum = self._traffic_cum.get(local_port)
@@ -2093,7 +2174,6 @@ class App(object):
             str(node.get("port") or ""),
             str(local_port) if local_port else "",
             latency_text,
-            speed_text,
             rt_text,
             total_text,
         )
@@ -2348,6 +2428,479 @@ class App(object):
         )
         return added, skipped, failed
 
+    # ----- 添加 / 编辑节点（v2rayN 式参数表单） ---------------------------
+
+    _NETWORKS = ("tcp", "ws", "grpc", "h2", "httpupgrade")
+    _TLS_OPTIONS = ("", "tls", "reality")
+    _VMESS_SECURITY = ("auto", "none", "aes-128-gcm", "chacha20-poly1305", "zero")
+    _SS_METHODS = (
+        "aes-256-gcm",
+        "aes-128-gcm",
+        "chacha20-poly1305",
+        "chacha20-ietf-poly1305",
+        "2022-blake3-aes-128-gcm",
+        "2022-blake3-aes-256-gcm",
+        "2022-blake3-chacha20-poly1305",
+        "none",
+    )
+    _FINGERPRINTS = ("", "chrome", "firefox", "safari", "ios", "android", "edge", "random")
+
+    def _open_editor_for_selection(self):
+        nodes = self._selected_nodes()
+        if not nodes:
+            messagebox.showinfo("提示", "请先在列表中选中节点。")
+            return
+        self._open_node_editor(nodes[0])
+
+    def _open_node_editor(self, node=None):
+        is_edit = node is not None
+        win = tk.Toplevel(self.root)
+        win.title("编辑节点" if is_edit else "添加节点")
+        win.geometry("560x600")
+        win.minsize(520, 480)
+        win.transient(self.root)
+        win.grab_set()
+
+        initial = {
+            "name": "",
+            "server": "",
+            "port": "",
+            "uuid": "",
+            "alter_id": "0",
+            "security": "auto",
+            "flow": "",
+            "user": "",
+            "password": "",
+            "method": "",
+            "network": "tcp",
+            "header_type": "",
+            "host": "",
+            "path": "",
+            "service_name": "",
+            "tls": "",
+            "sni": "",
+            "fp": "",
+            "pbk": "",
+            "sid": "",
+        }
+        if is_edit:
+            for key in initial:
+                value = node.get(key)
+                if key == "port":
+                    value = to_int(value)
+                    value = "" if value is None else str(value)
+                initial[key] = "" if value is None else str(value)
+        vars_map = {key: tk.StringVar(value=value) for key, value in initial.items()}
+        proto_var = vars_map["proto"] = tk.StringVar(
+            value=(node.get("proto") if is_edit else "") or "vless"
+        )
+
+        def field_rows(proto):
+            rows = [
+                ("proto", "协议类型"),
+                ("name", "别名 (名称)"),
+                ("server", "地址 (服务器)"),
+                ("port", "端口"),
+            ]
+            if proto == "vmess":
+                rows += [
+                    ("uuid", "用户 ID (UUID)"),
+                    ("alter_id", "alterId"),
+                    ("security", "加密方式 (security)"),
+                ]
+            elif proto == "vless":
+                rows += [
+                    ("uuid", "用户 ID (UUID)"),
+                    ("flow", "flow"),
+                ]
+            elif proto == "trojan":
+                rows.append(("password", "密码"))
+            elif proto == "ss":
+                rows += [
+                    ("method", "加密方式 (method)"),
+                    ("password", "密码"),
+                ]
+            elif proto == "socks":
+                rows += [
+                    ("user", "用户名 (可选)"),
+                    ("password", "密码 (可选)"),
+                ]
+            if proto == "socks":
+                # SOCKS5 上游无传输层/TLS 概念（Xray 的 socks 出站）
+                return rows
+            network = _normalize_network(vars_map["network"].get())
+            tls = _normalize_security(vars_map["tls"].get())
+            rows.append(("network", "传输协议 (network)"))
+            if network == "grpc":
+                rows.append(("service_name", "serviceName (gRPC)"))
+            else:
+                if network == "tcp":
+                    rows.append(("header_type", "伪装类型 (仅 http)"))
+                rows.append(("host", "伪装域名 (host)"))
+                rows.append(("path", "路径 (path)"))
+            rows.append(("tls", "底层传输安全"))
+            rows.append(("sni", "SNI"))
+            rows.append(("fp", "指纹 (fingerprint)"))
+            if tls == "reality":
+                rows += [
+                    ("pbk", "PublicKey (REALITY)"),
+                    ("sid", "ShortId (REALITY)"),
+                ]
+            return rows
+
+        form = ttk.Frame(win, padding=(12, 10))
+        form.pack(fill="both", expand=True)
+
+        def rebuild(*_args):
+            proto = str(proto_var.get()).strip().lower()
+            if proto == "shadowsocks":
+                proto = "ss"
+            for child in form.grid_slaves():
+                child.destroy()
+            for r, (key, label) in enumerate(field_rows(proto)):
+                ttk.Label(form, text=label + ":").grid(
+                    row=r, column=0, sticky="e", padx=(0, 6), pady=3
+                )
+                if key == "proto":
+                    widget = ttk.Combobox(
+                        form,
+                        textvariable=proto_var,
+                        values=("vmess", "vless", "trojan", "ss", "socks"),
+                        width=36,
+                        state="readonly",
+                    )
+                    widget.bind("<<ComboboxSelected>>", rebuild)
+                elif key == "network":
+                    widget = ttk.Combobox(
+                        form,
+                        textvariable=vars_map["network"],
+                        values=self._NETWORKS,
+                        width=36,
+                    )
+                    widget.bind("<<ComboboxSelected>>", rebuild)
+                elif key == "tls":
+                    widget = ttk.Combobox(
+                        form,
+                        textvariable=vars_map["tls"],
+                        values=self._TLS_OPTIONS,
+                        width=36,
+                    )
+                    widget.bind("<<ComboboxSelected>>", rebuild)
+                elif key == "security":
+                    widget = ttk.Combobox(
+                        form,
+                        textvariable=vars_map["security"],
+                        values=self._VMESS_SECURITY,
+                        width=36,
+                    )
+                elif key == "method":
+                    widget = ttk.Combobox(
+                        form,
+                        textvariable=vars_map["method"],
+                        values=self._SS_METHODS,
+                        width=36,
+                    )
+                elif key == "fp":
+                    widget = ttk.Combobox(
+                        form,
+                        textvariable=vars_map["fp"],
+                        values=self._FINGERPRINTS,
+                        width=36,
+                    )
+                elif key == "header_type":
+                    widget = ttk.Combobox(
+                        form,
+                        textvariable=vars_map["header_type"],
+                        values=("", "http"),
+                        width=36,
+                    )
+                elif key == "flow":
+                    widget = ttk.Combobox(
+                        form,
+                        textvariable=vars_map["flow"],
+                        values=("", "xtls-rprx-vision"),
+                        width=36,
+                    )
+                else:
+                    widget = ttk.Entry(
+                        form, textvariable=vars_map[key], width=38
+                    )
+                widget.grid(row=r, column=1, sticky="we", pady=3)
+            form.columnconfigure(1, weight=1)
+
+        rebuild()
+
+        hint = tk.Label(
+            win,
+            text="提示：保存时自动生成分享链接；双击列表「节点名称」可再次编辑",
+            fg="#666666",
+            anchor="w",
+        )
+        hint.pack(fill="x", padx=12, pady=(0, 4))
+
+        def do_cancel(_event=None):
+            win.destroy()
+            return "break"
+
+        def do_save(_event=None):
+            proto = str(proto_var.get()).strip().lower()
+            if proto == "shadowsocks":
+                proto = "ss"
+            if proto in ("socks5", "socks5h"):
+                proto = "socks"
+            if proto not in ("vmess", "vless", "trojan", "ss", "socks"):
+                messagebox.showwarning(
+                    "协议无效",
+                    "协议类型必须是 vmess / vless / trojan / ss / socks。",
+                    parent=win,
+                )
+                return "break"
+            values = {key: var.get().strip() for key, var in vars_map.items()}
+            server = values["server"]
+            port = to_int(values["port"])
+            if not server:
+                messagebox.showwarning("缺少地址", "请填写服务器地址。", parent=win)
+                return "break"
+            if not is_valid_port(port):
+                messagebox.showwarning(
+                    "端口无效", "端口必须是 1-65535 的整数。", parent=win
+                )
+                return "break"
+            if proto in ("vmess", "vless") and not values["uuid"]:
+                messagebox.showwarning(
+                    "缺少用户 ID", "vmess / vless 需要填写用户 ID (UUID)。", parent=win
+                )
+                return "break"
+            if proto in ("trojan", "ss") and not values["password"]:
+                messagebox.showwarning("缺少密码", "%s 需要填写密码。" % proto.upper(), parent=win)
+                return "break"
+            if proto == "ss" and not values["method"]:
+                messagebox.showwarning("缺少加密方式", "ss 需要填写加密方式 (method)。", parent=win)
+                return "break"
+            if proto == "socks" and values["password"] and not values["user"]:
+                messagebox.showwarning(
+                    "缺少用户名", "填写了 SOCKS5 密码时必须同时填写用户名。", parent=win
+                )
+                return "break"
+            tls = _normalize_security(values["tls"])
+            if proto == "socks":
+                tls = ""  # SOCKS5 上游没有传输层/TLS 设置
+            if tls == "reality" and not values["pbk"]:
+                messagebox.showwarning(
+                    "缺少 PublicKey", "REALITY 需要填写 PublicKey。", parent=win
+                )
+                return "break"
+
+            raw = {"proto": proto, "port": port}
+            for key in (
+                "name",
+                "server",
+                "uuid",
+                "flow",
+                "user",
+                "password",
+                "method",
+                "host",
+                "path",
+                "service_name",
+                "sni",
+                "fp",
+                "pbk",
+                "sid",
+                "header_type",
+            ):
+                raw[key] = values.get(key, "")
+            raw["alter_id"] = max(0, to_int(values.get("alter_id"), 0) or 0)
+            raw["security"] = values.get("security") or "auto"
+            raw["network"] = (
+                "tcp" if proto == "socks" else _normalize_network(values.get("network"))
+            )
+            raw["tls"] = tls
+
+            if is_edit:
+                merged = dict(node)
+                merged.update(raw)
+                cleaned = normalize_node(merged)
+                if cleaned is None:
+                    messagebox.showwarning("参数无效", "节点参数校验失败。", parent=win)
+                    return "break"
+                link = build_share_link(cleaned)
+                node.clear()
+                node.update(cleaned)
+                if link:
+                    node["link"] = link
+                self._refresh_tree()
+                self.save()
+                self.log(
+                    "已更新节点「%s」%s"
+                    % (
+                        node.get("name"),
+                        "（需重启 Xray 生效）" if self.service.is_running() else "",
+                    ),
+                    "ok",
+                )
+            else:
+                new_node = normalize_node(raw)
+                if new_node is None:
+                    messagebox.showwarning("参数无效", "节点参数校验失败。", parent=win)
+                    return "break"
+                key = node_key(new_node)
+                if any(node_key(n) == key for n in self.nodes):
+                    messagebox.showwarning(
+                        "节点重复", "相同协议/地址/端口/身份的节点已存在。", parent=win
+                    )
+                    return "break"
+                local_port = next_free_port(self.nodes, self._base_port())
+                if local_port is None:
+                    messagebox.showwarning(
+                        "端口不足", "没有可用的本地端口。", parent=win
+                    )
+                    return "break"
+                new_node["local_port"] = local_port
+                new_node["enabled"] = False
+                new_node["sub"] = ""
+                link = build_share_link(new_node)
+                if link:
+                    new_node["link"] = link
+                self.nodes.append(new_node)
+                self._refresh_tree()
+                self.save()
+                self.log(
+                    "已添加节点「%s」（本地端口 %d）" % (new_node["name"], local_port),
+                    "ok",
+                )
+            win.destroy()
+            return "break"
+
+        bar = ttk.Frame(win, padding=(12, 0, 12, 10))
+        bar.pack(side="bottom", fill="x")
+        ttk.Button(bar, text="保存", command=do_save).pack(side="right", padx=4)
+        ttk.Button(bar, text="取消", command=do_cancel).pack(side="right", padx=4)
+        win.bind("<Escape>", do_cancel)
+        win.bind("<Return>", do_save)
+
+    # ----- 全局设置 -------------------------------------------------------
+
+    def _open_settings(self):
+        win = tk.Toplevel(self.root)
+        win.title("全局设置 - %s %s" % (APP_NAME, APP_VERSION))
+        win.geometry("560x360")
+        win.resizable(False, False)
+        win.transient(self.root)
+        win.grab_set()
+
+        snapshot = (
+            self.xray_var.get(),
+            self.base_port_var.get(),
+            bool(self.lan_var.get()),
+            bool(self.mixed_var.get()),
+        )
+        latency_timeout_var = tk.StringVar(value=str(self._latency_timeout()))
+        latency_threads_var = tk.StringVar(value=str(self._latency_threads()))
+        log_lines_var = tk.StringVar(value=str(self._max_log_lines))
+
+        form = ttk.Frame(win, padding=(14, 12))
+        form.pack(fill="both", expand=True)
+        form.columnconfigure(1, weight=1)
+
+        row = 0
+        ttk.Label(form, text="xray.exe 路径:").grid(
+            row=row, column=0, sticky="e", padx=(0, 6), pady=4
+        )
+        path_row = ttk.Frame(form)
+        path_row.grid(row=row, column=1, sticky="we", pady=4)
+        ttk.Entry(path_row, textvariable=self.xray_var).pack(
+            side="left", fill="x", expand=True
+        )
+        ttk.Button(path_row, text="浏览...", command=self._browse_xray).pack(
+            side="left", padx=(6, 0)
+        )
+        row += 1
+        ttk.Label(form, text="起始 SOCKS5 端口:").grid(
+            row=row, column=0, sticky="e", padx=(0, 6), pady=4
+        )
+        ttk.Entry(
+            form, textvariable=self.base_port_var, width=8, justify="center"
+        ).grid(row=row, column=1, sticky="w", pady=4)
+        row += 1
+        ttk.Checkbutton(
+            form, text="允许局域网访问 (0.0.0.0)", variable=self.lan_var
+        ).grid(row=row, column=1, sticky="w", pady=4)
+        row += 1
+        ttk.Checkbutton(
+            form, text="混合端口 (HTTP+SOCKS)", variable=self.mixed_var
+        ).grid(row=row, column=1, sticky="w", pady=4)
+        row += 1
+        ttk.Label(form, text="延迟测试超时 (秒):").grid(
+            row=row, column=0, sticky="e", padx=(0, 6), pady=4
+        )
+        ttk.Entry(
+            form, textvariable=latency_timeout_var, width=8, justify="center"
+        ).grid(row=row, column=1, sticky="w", pady=4)
+        row += 1
+        ttk.Label(form, text="延迟测试并发数:").grid(
+            row=row, column=0, sticky="e", padx=(0, 6), pady=4
+        )
+        ttk.Entry(
+            form, textvariable=latency_threads_var, width=8, justify="center"
+        ).grid(row=row, column=1, sticky="w", pady=4)
+        row += 1
+        ttk.Label(form, text="运行日志上限 (行):").grid(
+            row=row, column=0, sticky="e", padx=(0, 6), pady=4
+        )
+        ttk.Entry(
+            form, textvariable=log_lines_var, width=8, justify="center"
+        ).grid(row=row, column=1, sticky="w", pady=4)
+        row += 1
+        ttk.Label(
+            form,
+            text="提示：端口 / 局域网 / 混合端口修改后需重启 Xray 生效",
+            foreground="#666666",
+        ).grid(row=row, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        def do_cancel(_event=None):
+            xray, base, lan, mixed = snapshot
+            self.xray_var.set(xray)
+            self.base_port_var.set(base)
+            self.lan_var.set(lan)
+            self.mixed_var.set(mixed)
+            win.destroy()
+            return "break"
+
+        def do_save(_event=None):
+            self._base_port()  # 校验起始端口并回写合法值
+            timeout = to_float(latency_timeout_var.get(), LATENCY_TIMEOUT)
+            self.settings["latency_timeout"] = min(
+                60.0, max(1.0, timeout or LATENCY_TIMEOUT)
+            )
+            threads = to_int(latency_threads_var.get(), LATENCY_THREADS)
+            self.settings["latency_threads"] = min(
+                64, max(1, threads or LATENCY_THREADS)
+            )
+            lines = to_int(log_lines_var.get(), MAX_LOG_LINES)
+            self._max_log_lines = min(100000, max(100, lines or MAX_LOG_LINES))
+            self.settings["max_log_lines"] = self._max_log_lines
+            self._refresh_lport_header()
+            self.save()
+            self.log(
+                "全局设置已保存（延迟超时 %s 秒 / 并发 %s / 日志上限 %s 行）"
+                % (
+                    self.settings["latency_timeout"],
+                    self.settings["latency_threads"],
+                    self._max_log_lines,
+                ),
+                "sys",
+            )
+            win.destroy()
+            return "break"
+
+        bar = ttk.Frame(win, padding=(14, 0, 14, 10))
+        bar.pack(side="bottom", fill="x")
+        ttk.Button(bar, text="保存", command=do_save).pack(side="right", padx=4)
+        ttk.Button(bar, text="取消", command=do_cancel).pack(side="right", padx=4)
+        win.bind("<Escape>", do_cancel)
+        win.bind("<Return>", do_save)
+
     def _set_all_enabled(self, enabled):
         for node in self.nodes:
             node["enabled"] = bool(enabled)
@@ -2381,9 +2934,7 @@ class App(object):
         self.nodes.sort(key=sort_key)
         self._refresh_tree()
         self.save()
-        self.log(
-            "已按%s排序" % ("延迟升序" if field == "latency" else "速度降序"), "sys"
-        )
+        self.log("已按延迟升序排序", "sys")
 
     # ----- 表格交互 ------------------------------------------------------
 
@@ -2406,11 +2957,15 @@ class App(object):
 
     def _on_tree_double(self, event):
         try:
-            if self.tree.identify_column(event.x) != "#6":
-                return None
+            column = self.tree.identify_column(event.x)
             iid = self.tree.identify_row(event.y)
             node = self._node_by_nid(iid)
             if node is None:
+                return None
+            if column == "#2":  # 双击节点名称 → 编辑节点参数
+                self._open_node_editor(node)
+                return "break"
+            if column != "#6":  # 双击本地端口列 → 修改端口
                 return None
             current = node.get("local_port") or ""
             value = simpledialog.askstring(
@@ -2636,16 +3191,22 @@ class App(object):
 
     # ----- 测试 ----------------------------------------------------------
 
+    def _latency_timeout(self):
+        value = to_float(self.settings.get("latency_timeout"), LATENCY_TIMEOUT)
+        return min(60.0, max(1.0, value or LATENCY_TIMEOUT))
+
+    def _latency_threads(self):
+        value = to_int(self.settings.get("latency_threads"), LATENCY_THREADS)
+        return min(64, max(1, value or LATENCY_THREADS))
+
     @staticmethod
-    def _test_one(mode, port):
+    def _test_one(port, timeout):
         try:
-            if mode == "latency":
-                return test_latency(port)
-            return test_download(port)
+            return test_latency(port, timeout)
         except Exception:
             return None
 
-    def _run_tests(self, mode):
+    def _run_tests(self):
         if self.busy_test:
             return
         if not self.service.is_running():
@@ -2665,25 +3226,22 @@ class App(object):
             return
         self.busy_test = True
         self._update_buttons()
-        self.log(
-            "开始%s，共 %d 个节点..."
-            % ("延迟测试" if mode == "latency" else "下载测速", len(targets)),
-            "sys",
-        )
+        self.log("开始延迟测试，共 %d 个节点..." % len(targets), "sys")
         thread = threading.Thread(
-            target=self._test_worker, args=(mode, targets), daemon=True
+            target=self._test_worker,
+            args=(targets, self._latency_timeout(), self._latency_threads()),
+            daemon=True,
         )
         thread.start()
 
-    def _test_worker(self, mode, targets):
+    def _test_worker(self, targets, timeout, threads):
         ok = 0
         fail = 0
         try:
-            workers = min(6, max(1, len(targets)))
-            with ThreadPoolExecutor(max_workers=workers) as pool:
+            with ThreadPoolExecutor(max_workers=threads) as pool:
                 futures = {}
                 for nid, port in targets:
-                    futures[pool.submit(self._test_one, mode, port)] = nid
+                    futures[pool.submit(self._test_one, port, timeout)] = nid
                 for future in as_completed(futures):
                     nid = futures[future]
                     try:
@@ -2694,11 +3252,11 @@ class App(object):
                         fail += 1
                     else:
                         ok += 1
-                    self.q.put(("test_result", mode, nid, value))
+                    self.q.put(("test_result", nid, value))
         except Exception as exc:
-            self.q.put(("log", "测速任务异常：%s" % exc, "err"))
+            self.q.put(("log", "延迟测试任务异常：%s" % exc, "err"))
         finally:
-            self.q.put(("test_done", mode, ok, fail))
+            self.q.put(("test_done", ok, fail))
 
     # ----- 下载 xray.exe -------------------------------------------------
 
@@ -2793,10 +3351,6 @@ class App(object):
 
     # ----- 持久化 / 关窗 -------------------------------------------------
 
-    def _on_mixed_toggle(self):
-        self.save()
-        self._refresh_lport_header()
-
     def _refresh_lport_header(self):
         try:
             mixed = bool(self.mixed_var.get())
@@ -2815,6 +3369,9 @@ class App(object):
             "base_port": self._base_port(),
             "lan_access": bool(self.lan_var.get()),
             "mixed_port": bool(self.mixed_var.get()),
+            "latency_timeout": self._latency_timeout(),
+            "latency_threads": self._latency_threads(),
+            "max_log_lines": self._max_log_lines,
             "subs": [dict(sub) for sub in self.subs],
             "nodes": self.nodes,
         }
@@ -2990,7 +3547,6 @@ def selftest():
         old_node["local_port"] = 20001
         old_node["enabled"] = True
         old_node["latency"] = 12
-        old_node["speed"] = 345.6
         old_nid = old_node["nid"]
 
         new_nodes, _ = parse_subscription_text(vm_link)
@@ -3003,7 +3559,6 @@ def selftest():
         _expect(merged[0]["local_port"] == 20001, "local_port 未保留")
         _expect(merged[0]["enabled"] is True, "enabled 未保留")
         _expect(merged[0]["latency"] == 12, "latency 未保留")
-        _expect(merged[0]["speed"] == 345.6, "speed 未保留")
         _expect(merged[0]["sub"] == "http://example.com/sub", "订阅归属丢失")
 
     @check("build_xray_config 结构与协议/传输层")
@@ -3160,7 +3715,6 @@ def selftest():
         _expect(is_valid_port(10808), "合法端口误判")
         _expect(not is_valid_port(0), "0 端口误判")
         _expect(not is_valid_port(70000), "超范围端口误判")
-        _expect("KB/s" in format_speed(2048), "速度格式化错误")
         _expect(
             node_key({"proto": "vmess", "server": "a", "port": 1, "uuid": "u"})
             == "vmess|a|1|u",
@@ -3170,6 +3724,135 @@ def selftest():
             redact("vless://secret@example.com:443") == "***",
             "日志脱敏失败",
         )
+
+    @check("手动节点参数生成分享链接并可回环解析")
+    def _check_share_link():
+        base = {
+            "name": "手动-测试",
+            "server": "manual.example.com",
+            "port": 8443,
+            "network": "ws",
+            "host": "cdn.manual.com",
+            "path": "/m",
+            "tls": "tls",
+            "sni": "cdn.manual.com",
+            "fp": "safari",
+        }
+
+        vm = dict(base, proto="vmess", uuid=vm_uuid, alter_id=2, security="aes-128-gcm")
+        link = build_share_link(vm)
+        _expect(link.startswith("vmess://"), "vmess 链接前缀错误")
+        back = parse_share_link(link)
+        _expect(back is not None, "vmess 链接回环解析失败")
+        _expect(back["uuid"] == vm_uuid, "vmess uuid 回环不一致")
+        _expect(back["alter_id"] == 2, "vmess alterId 回环不一致")
+        _expect(back["network"] == "ws" and back["path"] == "/m", "vmess 传输回环不一致")
+        _expect(back["tls"] == "tls" and back["fp"] == "safari", "vmess tls 回环不一致")
+        _expect(back["name"] == "手动-测试", "vmess 名称回环不一致")
+
+        vl = dict(
+            base,
+            proto="vless",
+            uuid=vl_uuid,
+            flow="xtls-rprx-vision",
+            network="tcp",
+            host="",
+            path="",
+            tls="reality",
+            pbk="PUBKEY_MANUAL",
+            sid="1234abcd",
+        )
+        link = build_share_link(vl)
+        _expect(link.startswith("vless://"), "vless 链接前缀错误")
+        back = parse_share_link(link)
+        _expect(back is not None, "vless 链接回环解析失败")
+        _expect(back["uuid"] == vl_uuid and back["flow"] == "xtls-rprx-vision", "vless 回环不一致")
+        _expect(back["tls"] == "reality", "vless reality 回环不一致")
+        _expect(back["pbk"] == "PUBKEY_MANUAL" and back["sid"] == "1234abcd", "reality 参数回环不一致")
+
+        tr = dict(base, proto="trojan", password="p@ss:word", network="tcp", host="", path="")
+        link = build_share_link(tr)
+        _expect(link.startswith("trojan://"), "trojan 链接前缀错误")
+        back = parse_share_link(link)
+        _expect(back is not None, "trojan 链接回环解析失败")
+        _expect(back["password"] == "p@ss:word", "trojan 密码回环不一致")
+        _expect(back["tls"] == "tls", "trojan 默认 tls 回环不一致")
+
+        ss_node = dict(base, proto="ss", method="aes-256-gcm", password="p@ss")
+        ss_node["tls"] = ""
+        link = build_share_link(ss_node)
+        _expect(link.startswith("ss://"), "ss 链接前缀错误")
+        back = parse_share_link(link)
+        _expect(back is not None, "ss 链接回环解析失败")
+        _expect(back["method"] == "aes-256-gcm" and back["password"] == "p@ss", "ss 回环不一致")
+        _expect(back["server"] == "manual.example.com" and back["port"] == 8443, "ss 地址回环不一致")
+
+        _expect(build_share_link({"proto": "vless"}) == "", "非法节点应返回空链接")
+        grpc_node = dict(base, proto="vless", uuid=vl_uuid, network="grpc",
+                         host="", path="", service_name="grpc-svc", tls="")
+        back = parse_share_link(build_share_link(grpc_node))
+        _expect(back is not None and back["network"] == "grpc", "grpc 回环不一致")
+        _expect(back["service_name"] == "grpc-svc", "grpc serviceName 回环不一致")
+
+    @check("SOCKS5 节点：出站配置 / 分享链接 / 回环解析")
+    def _check_socks():
+        plain = {
+            "proto": "socks",
+            "server": "socks.example.com",
+            "port": 1080,
+            "name": "上游-SOCKS5",
+        }
+        out = build_outbound(plain, "p1080")
+        _expect(out is not None, "socks 出站生成失败")
+        _expect(out["protocol"] == "socks", "socks 出站协议错误")
+        server = out["settings"]["servers"][0]
+        _expect(server["address"] == "socks.example.com" and server["port"] == 1080,
+                "socks 出站地址错误")
+        _expect("users" not in server, "无认证 socks 不应带 users")
+        _expect("streamSettings" not in out, "socks 出站不应带 streamSettings")
+
+        auth = dict(plain, user="u1", password="p@ss:1")
+        out = build_outbound(auth, "p1081")
+        users = out["settings"]["servers"][0]["users"][0]
+        _expect(users["user"] == "u1" and users["pass"] == "p@ss:1", "socks 认证信息错误")
+
+        # 链接回环（无认证）
+        node = normalize_node(dict(plain))
+        _expect(node is not None and node["proto"] == "socks", "socks5 节点归一化失败")
+        link = build_share_link(node)
+        _expect(link.startswith("socks://"), "socks 链接前缀错误：%r" % link)
+        back = parse_share_link(link)
+        _expect(back is not None, "socks 链接回环解析失败")
+        _expect(back["server"] == "socks.example.com" and back["port"] == 1080, "socks 地址回环不一致")
+        _expect(back["user"] == "" and back["password"] == "", "无认证 socks 凭据应留空")
+        _expect(back["name"] == "上游-SOCKS5", "socks 名称回环不一致")
+
+        # 链接回环（带认证，密码含特殊字符）
+        node = normalize_node(dict(auth))
+        back = parse_share_link(build_share_link(node))
+        _expect(back is not None, "带认证 socks 链接回环解析失败")
+        _expect(back["user"] == "u1" and back["password"] == "p@ss:1", "socks 凭据回环不一致")
+
+        # 也接受 socks5:// 写法
+        alt = parse_share_link("socks5://u2:p2@1.2.3.4:1081#alt")
+        _expect(alt is not None and alt["proto"] == "socks", "socks5:// 链接未识别")
+        _expect(alt["user"] == "u2" and alt["password"] == "p2", "socks5:// 凭据解析错误")
+
+        # 进配置：inbound + outbound + 路由规则
+        cfg_node = dict(auth, enabled=True, local_port=10900)
+        cfg = build_xray_config([cfg_node])
+        _expect(len(cfg["inbounds"]) == 1, "socks 节点 inbound 数量错误")
+        socks_out = [o for o in cfg["outbounds"] if o["protocol"] == "socks"]
+        _expect(len(socks_out) == 1, "socks 节点未写进 outbounds")
+        _expect(
+            cfg["routing"]["rules"][1]["outboundTag"] == "p10900",
+            "socks 节点路由规则错误",
+        )
+
+        # node_key 区分不同账号
+        a = {"proto": "socks", "server": "s", "port": 1, "user": "a", "password": "x"}
+        b = {"proto": "socks", "server": "s", "port": 1, "user": "b", "password": "x"}
+        _expect(node_key(a) != node_key(b), "socks 不同账号应视为不同节点")
 
     failures = 0
     for name, func in checks:
